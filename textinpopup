@@ -1,0 +1,714 @@
+import cv2
+import mediapipe as mp
+import math
+import threading
+import winsound
+import time
+import datetime
+import os
+from queue import Queue, Empty
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
+from win10toast import ToastNotifier
+import tkinter as tk
+from tkinter import font as tkfont
+from tkinter import filedialog
+from PIL import Image, ImageDraw, ImageTk
+
+# Queue for popup requests to ensure popups are created on the main thread
+popup_queue = Queue()
+# ------------------- ฟังก์ชันคำนวณมุม -------------------
+def calculate_angle(a, b, c):
+    """ a,b,c = (x, y) """
+    ba = (a[0]-b[0], a[1]-b[1])
+    bc = (c[0]-b[0], c[1]-b[1])
+    dot = ba[0]*bc[0] + ba[1]*bc[1]
+    mag_ba = math.hypot(ba[0], ba[1])
+    mag_bc = math.hypot(bc[0], bc[1])
+    angle_rad = math.acos(dot / (mag_ba * mag_bc + 1e-7))
+    return math.degrees(angle_rad)
+
+# ------------------- ฟังก์ชันแสดงป็อปอัปแบบกำหนดเอง -------------------
+def create_instruction_icon(instruction_type, size=32):
+    """Create icons matching each instruction type"""
+    icon_img = Image.new('RGBA', (size, size), (255, 255, 255, 0))
+    icon_draw = ImageDraw.Draw(icon_img)
+    
+    if "Bend" in instruction_type:
+        # Curved bend icon
+        icon_draw.arc([(5, 5), (size-5, size-5)], 0, 180, fill='#4CAF50', width=4)
+        icon_draw.polygon([(size-8, size//2), (size-12, size//2-4), (size-12, size//2+4)], fill='#4CAF50')
+    elif "Straighten" in instruction_type:
+        # Straight line icon
+        icon_draw.line([(5, size//2), (size-5, size//2)], fill='#2196F3', width=4)
+        icon_draw.polygon([(size-8, size//2-4), (size-5, size//2), (size-8, size//2+4)], fill='#2196F3')
+    elif "Lift" in instruction_type or "Raise" in instruction_type:
+        # Up arrow icon
+        icon_draw.line([(size//2, size-5), (size//2, 5)], fill='#FF9800', width=4)
+        icon_draw.polygon([(size//2, 5), (size//2-5, 12), (size//2+5, 12)], fill='#FF9800')
+    elif "Lower" in instruction_type:
+        # Down arrow icon
+        icon_draw.line([(size//2, 5), (size//2, size-5)], fill='#FF9800', width=4)
+        icon_draw.polygon([(size//2, size-5), (size//2-5, size-12), (size//2+5, size-12)], fill='#FF9800')
+    else:
+        # Default warning icon
+        triangle = [(size//2, 3), (size-3, size-3), (3, size-3)]
+        icon_draw.polygon(triangle, fill='#FFD700', outline='#FF6B6B', width=2)
+    
+    return icon_img
+
+# ------------------- ฟังก์ชันเพิ่มรูปภาพ -------------------
+def select_posture_guide_image():
+    """Allow user to select a posture guide image and save it"""
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    
+    file_path = filedialog.askopenfilename(
+        title="Select Posture Guide Image", 
+        filetypes=[
+            ("Image files", "*.png *.jpg *.jpeg *.bmp *.gif"),
+            ("PNG files", "*.png"),
+            ("JPG files", "*.jpg *.jpeg"),
+            ("All files", "*.*")
+        ]
+    )
+    
+    if file_path:
+        try:
+            # Load the image and resize it
+            img = Image.open(file_path)
+            try:
+                img.thumbnail((600, 300), Image.Resampling.LANCZOS)
+            except Exception:
+                # Fallback for older Pillow versions
+                img.thumbnail((600, 300), Image.ANTIALIAS)
+
+            # Save it as posture_guide.png in the script directory
+            save_path = os.path.join(os.path.dirname(__file__), "posture_guide.png")
+            img.save(save_path)
+            
+            root.destroy()
+            print(f"✓ Image saved successfully: {save_path}")
+            return True
+        except Exception as e:
+            print(f"✗ Error saving image: {e}")
+            root.destroy()
+            return False
+    else:
+        root.destroy()
+        print("No image selected")
+        return False
+
+def show_custom_notification(title, messages_list, duration=15):
+    """Display a custom notification window with posture guide image"""
+    root = tk.Tk()
+    # Larger window to accommodate image and messages
+    height = 600
+    root.geometry(f"700x{height}")
+    root.title(title)
+    root.attributes('-topmost', True)
+    root.attributes('-alpha', 0.95)
+    
+    # Set background color
+    root.configure(bg='#FFE6E6')
+    
+    # Create title label
+    title_font = tkfont.Font(family="Arial", size=14, weight="bold")
+    title_label = tk.Label(root, text=title, font=title_font, bg='#FFE6E6', fg='#FF6B6B')
+    title_label.pack(pady=10)
+    
+    # Create canvas with scrollbar for content
+    canvas_frame = tk.Frame(root, bg='#FFE6E6')
+    canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+    
+    # Load custom image if it exists
+    image_path = os.path.join(os.path.dirname(__file__), "posture_guide.png")
+    has_image = False
+    
+    if os.path.exists(image_path):
+        try:
+            guide_img = Image.open(image_path)
+            # Resize image to fit in popup - make it larger
+            guide_img.thumbnail((600, 300), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(guide_img)
+            
+            # Create image label
+            img_label = tk.Label(canvas_frame, image=photo, bg='#FFE6E6')
+            img_label.image = photo  # Keep reference
+            img_label.pack(pady=15)
+            has_image = True
+            print(f"✓ Posture guide image loaded successfully")
+        except Exception as e:
+            print(f"⚠ Could not load image: {e}")
+    else:
+        print(f"⚠ Image not found at: {image_path}")
+        print("  To add image: Save posture_guide.png in the same folder as this script")
+    
+    # Add label text if image loaded
+    if has_image:
+        img_text_font = tkfont.Font(family="Arial", size=9, slant="italic")
+        img_text_label = tk.Label(canvas_frame, text="↑ Correct Posture Guide ↑", font=img_text_font, bg='#FFE6E6', fg='#666666')
+        img_text_label.pack()
+    
+    # Add separator line
+    separator = tk.Frame(canvas_frame, height=2, bg='#CCCCCC')
+    separator.pack(fill=tk.X, pady=10)
+    
+    # Add messages header
+    msg_header = tk.Label(canvas_frame, text="Adjustments Needed:", font=tkfont.Font(family="Arial", size=10, weight="bold"), 
+                          bg='#FFE6E6', fg='#FF6B6B')
+    msg_header.pack(pady=5)
+    
+    # Add each message
+    msg_font = tkfont.Font(family="Arial", size=10)
+    for message in messages_list[:5]:  # Show up to 5 messages
+        msg_label = tk.Label(canvas_frame, text="• " + message, font=msg_font, bg='#FFE6E6', fg='#333333', justify=tk.LEFT)
+        msg_label.pack(fill=tk.X, pady=4, padx=20)
+    
+    # Auto close after duration
+    root.after(duration * 1000, root.destroy)
+    root.mainloop()
+
+# ------------------- ตั้งค่า MediaPipe -------------------
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
+
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) 
+# Reduce resolution for faster processing
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FPS, 30)
+cv2.namedWindow("Ergonomics Pose Detector", cv2.WINDOW_NORMAL)
+cv2.setWindowProperty("Ergonomics Pose Detector", cv2.WND_PROP_TOPMOST, 1) # บังคับเด้งมาข้างหน้า
+
+# Ask user to add posture guide image at startup
+print("\n" + "="*50)
+print("POSTURE DETECTOR SETUP")
+print("="*50)
+posture_guide_path = os.path.join(os.path.dirname(__file__), "posture_guide.png")
+if not os.path.exists(posture_guide_path):
+    print("\n⚠ No posture guide image found.")
+    print("Would you like to add a posture guide image?")
+    print("\nTo add an image:")
+    print("1. Call: select_posture_guide_image()")
+    print("2. Or place 'posture_guide.png' in: " + os.path.dirname(__file__))
+    print("\nPress Enter to continue without image...")
+    input()
+else:
+    print("✓ Posture guide image found!")
+
+print("\nStarting pose detection...")
+print("Press 'q' to quit\n")
+print("="*50 + "\n")
+
+# Create a hidden Tk root on the main thread so we can create non-blocking Toplevel popups
+hidden_tk_root = tk.Tk()
+hidden_tk_root.withdraw()
+active_popups = []
+
+def create_popup_window(title, messages_list, duration=15):
+    """Create a non-blocking Toplevel popup using the hidden main Tk root."""
+    try:
+        top = tk.Toplevel(hidden_tk_root)
+        top.title(title)
+        top.attributes('-topmost', True)
+        top.attributes('-alpha', 0.95)
+        top.configure(bg='#FFE6E6')
+
+        # Title
+        title_font = tkfont.Font(family="Arial", size=12, weight="bold")
+        title_label = tk.Label(top, text=title, font=title_font, bg='#FFE6E6', fg='#FF6B6B')
+        title_label.pack(pady=8, padx=8)
+
+        # Load image if exists
+        image_path = os.path.join(os.path.dirname(__file__), "posture_guide.png")
+        if os.path.exists(image_path):
+            try:
+                guide_img = Image.open(image_path)
+                try:
+                    guide_img.thumbnail((600, 300), Image.Resampling.LANCZOS)
+                except Exception:
+                    guide_img.thumbnail((600, 300), Image.ANTIALIAS)
+                photo = ImageTk.PhotoImage(guide_img)
+                img_label = tk.Label(top, image=photo, bg='#FFE6E6')
+                img_label.image = photo
+                img_label.pack(pady=6)
+            except Exception:
+                pass
+
+        # Messages
+        msg_frame = tk.Frame(top, bg='#FFE6E6')
+        msg_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        msg_font = tkfont.Font(family="Arial", size=10)
+        for message in messages_list[:6]:
+            lbl = tk.Label(msg_frame, text="• " + message, font=msg_font, bg='#FFE6E6', fg='#333333', anchor='w', justify=tk.LEFT)
+            lbl.pack(fill=tk.X, pady=2)
+
+        # Schedule destruction
+        top.after(duration * 1000, lambda: (top.destroy(), active_popups.remove(top) if top in active_popups else None))
+        active_popups.append(top)
+    except Exception as e:
+        print(f"⚠ Could not create popup: {e}")
+
+
+# Start background pose processor so display is non-blocking
+# alarm state to avoid repeated triggers
+alarm_active = False
+notification_shown = False
+toaster = ToastNotifier()
+
+# Excel export setup
+excel_path = os.path.join(os.path.dirname(__file__), "posture_log.xlsx")
+header = [
+        "DateTime",
+        "Seconds",
+        "Score",
+        "Knee_Angle",
+        "Knee_Status",
+        "Hip_Angle",
+        "Hip_Status",
+        "Elbow_Angle",
+        "Elbow_Status",
+        "Wrist_Angle",
+        "Wrist_Status",
+        "Neck_Angle",
+        "Neck_Status",
+        "Shoulder_Angle",
+        "Shoulder_Status",
+        "Torso_Angle",
+        "Torso_Status",
+        "BadAngles",
+        "PostureCategory"
+]
+
+average_header = [
+    "Period_Start",
+    "Period_End",
+    "Duration_Minutes",
+    "Avg_Knee_Angle",
+    "Avg_Hip_Angle",
+    "Avg_Elbow_Angle",
+    "Avg_Wrist_Angle",
+    "Avg_Neck_Angle",
+    "Avg_Shoulder_Angle",
+    "Avg_Torso_Angle",
+    "Avg_Score"
+]
+
+# create file with headers if it doesn't exist
+if not os.path.exists(excel_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.append(header)
+
+    # Create a second sheet for 10-minute averages
+    ws_avg = wb.create_sheet("10-Minute Averages")
+    ws_avg.append(average_header)
+
+    wb.save(excel_path)
+
+# start time for seconds counter (starts at 0)
+start_time = time.time()
+
+# Data structures for 10-minute averaging
+angle_buffer = {
+    "knee": [],
+    "hip": [],
+    "elbow": [],
+    "wrist": [],
+    "neck": [],
+    "shoulder": [],
+    "torso": [],
+    "score": []
+}
+last_average_time = time.time()
+ten_minutes = 600  # 10 minutes in seconds
+
+def alarm_beep():
+    # keep beeping while alarm_active is True; stops when main loop clears alarm_active
+    while alarm_active:
+        winsound.Beep(1000, 300)
+        time.sleep(0.25)
+
+# Excel write queue for background processing
+excel_queue = Queue()
+write_stop = threading.Event()
+
+def excel_writer():
+    """Background thread that writes to Excel without blocking main loop"""
+    while not write_stop.is_set():
+        try:
+            item = excel_queue.get(timeout=0.1)
+            if item is None:
+                break
+            row_data, is_average = item
+            wb = load_workbook(excel_path)
+            if is_average:
+                ws = wb["10-Minute Averages"]
+                ws.append(row_data[0])
+                yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                last_row = ws.max_row
+                for col in range(4, 12):
+                    ws.cell(row=last_row, column=col).fill = yellow_fill
+            else:
+                ws = wb.active
+                ws.append(row_data)
+            wb.save(excel_path)
+        except:
+            pass
+    
+# Start background Excel writer thread
+writer_thread = threading.Thread(target=excel_writer, daemon=True)
+writer_thread.start()
+
+# Frame processing queue and background pose worker
+frame_queue = Queue(maxsize=1)
+landmarks_lock = threading.Lock()
+last_landmarks = None  # updated by worker thread
+last_status = []
+process_stop = threading.Event()
+
+def pose_worker():
+    global last_landmarks
+    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as worker_pose:
+        while not process_stop.is_set():
+            try:
+                frame_to_process = frame_queue.get(timeout=0.1)
+            except Empty:
+                continue
+            try:
+                img_rgb = cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)
+                img_rgb.flags.writeable = False
+                results = worker_pose.process(img_rgb)
+                img_rgb.flags.writeable = True
+                if results and results.pose_landmarks:
+                    with landmarks_lock:
+                        last_landmarks = results.pose_landmarks
+            except Exception:
+                pass
+
+# Start pose worker thread
+worker_thread = threading.Thread(target=pose_worker, daemon=True)
+worker_thread.start()
+
+while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("ไม่สามารถเปิดกล้องได้")
+            break     
+        # Process any pending popup requests (create Toplevels on main thread)
+        try:
+            while True:
+                title, msgs, dur = popup_queue.get_nowait()
+                create_popup_window(title, msgs, dur)
+        except Empty:
+            pass
+        # Let Tk process events for active popups
+        try:
+            hidden_tk_root.update()
+        except Exception:
+            # ignore Tk update errors during shutdown
+            pass
+        # Send frame to background pose worker (non-blocking) to avoid display lag
+        try:
+            # keep only the latest frame in queue
+            if frame_queue.full():
+                try:
+                    _ = frame_queue.get_nowait()
+                except Empty:
+                    pass
+            frame_queue.put_nowait(frame.copy())
+        except Exception:
+            pass
+        
+        # Display using last known landmarks (always shows something)
+        with landmarks_lock:
+            lmk = last_landmarks
+        if lmk:
+            landmarks = lmk.landmark
+
+            # ดึงพิกัดที่จำเป็น
+            def get_point(idx):
+                return [landmarks[idx].x, landmarks[idx].y]
+
+            # ------------------- คำนวณมุม -------------------
+            knee_angle = calculate_angle(get_point(mp_pose.PoseLandmark.RIGHT_HIP.value),
+                                         get_point(mp_pose.PoseLandmark.RIGHT_KNEE.value),
+                                         get_point(mp_pose.PoseLandmark.RIGHT_ANKLE.value))
+
+            hip_angle = calculate_angle(get_point(mp_pose.PoseLandmark.RIGHT_SHOULDER.value),
+                                        get_point(mp_pose.PoseLandmark.RIGHT_HIP.value),
+                                        get_point(mp_pose.PoseLandmark.RIGHT_KNEE.value))
+
+            elbow_angle = calculate_angle(get_point(mp_pose.PoseLandmark.RIGHT_SHOULDER.value),
+                                          get_point(mp_pose.PoseLandmark.RIGHT_ELBOW.value),
+                                          get_point(mp_pose.PoseLandmark.RIGHT_WRIST.value))
+
+            wrist_angle = calculate_angle(get_point(mp_pose.PoseLandmark.RIGHT_ELBOW.value),
+                                          get_point(mp_pose.PoseLandmark.RIGHT_WRIST.value),
+                                          get_point(mp_pose.PoseLandmark.RIGHT_WRIST.value))  # ใช้เป็น reference
+
+            shoulder_angle = calculate_angle(get_point(mp_pose.PoseLandmark.RIGHT_ELBOW.value),
+                                            get_point(mp_pose.PoseLandmark.RIGHT_SHOULDER.value),
+                                            get_point(mp_pose.PoseLandmark.RIGHT_HIP.value))
+
+            neck_angle = calculate_angle(get_point(mp_pose.PoseLandmark.NOSE.value),
+                                         get_point(mp_pose.PoseLandmark.RIGHT_SHOULDER.value),
+                                         get_point(mp_pose.PoseLandmark.RIGHT_HIP.value))
+
+            torso_angle = calculate_angle(get_point(mp_pose.PoseLandmark.RIGHT_SHOULDER.value),
+                                          get_point(mp_pose.PoseLandmark.RIGHT_HIP.value),
+                                          get_point(mp_pose.PoseLandmark.RIGHT_KNEE.value))
+
+            # ------------------- ตรวจเกณฑ์ -------------------
+            status = []
+            score = 0
+
+            if 90 <= knee_angle <= 100:
+                status.append(f"Knee OK: {knee_angle:.1f}°")
+                score += 1
+            else:
+                status.append(f"Knee Bad: {knee_angle:.1f}°")
+
+            if 90 <= hip_angle <= 100:
+                status.append(f"Hip OK: {hip_angle:.1f}°")
+                score += 1
+            else:
+                status.append(f"Hip Bad: {hip_angle:.1f}°")
+
+            if 90 <= elbow_angle <= 120:
+                status.append(f"Elbow OK: {elbow_angle:.1f}°")
+                score += 1
+            else:
+                status.append(f"Elbow Bad: {elbow_angle:.1f}°")
+
+            if 9 <= wrist_angle <= 10 :  # ข้อมือ ±10
+                status.append(f"Wrist OK: {wrist_angle:.1f}°")
+                score += 1
+            else:
+                status.append(f"Wrist Bad: {wrist_angle:.1f}°")
+
+            if neck_angle <= 15:
+                status.append(f"Neck OK: {neck_angle:.1f}°")
+                score += 1
+            else:
+                status.append(f"Neck Bad: {neck_angle:.1f}°")
+
+            if shoulder_angle <= 20:
+                status.append(f"Shoulder OK: {shoulder_angle:.1f}°")
+                score += 1
+            else:
+                status.append(f"Shoulder Bad: {shoulder_angle:.1f}°")
+
+            if 100 <= torso_angle <= 110:
+                status.append(f"Torso OK: {torso_angle:.1f}°")
+                score += 1
+            else:
+                status.append(f"Torso Bad: {torso_angle:.1f}°")
+                
+            # Trigger alarm when score < 3; stop only when score >= 3
+            if score < 3:
+                if not alarm_active:
+                    alarm_active = True
+                    threading.Thread(target=alarm_beep, daemon=True).start()
+                if not notification_shown:
+                    notification_shown = True
+                    
+                    # Define setpoints for each joint
+                    knee_setpoint = 95
+                    hip_setpoint = 95
+                    elbow_setpoint = 105
+                    back_setpoint = 105
+                    shoulder_setpoint = 20
+                    neck_setpoint = 15
+                    wrist_setpoint = 9.5
+                    
+                    # Generate feedback messages based on angle comparisons
+                    feedback_messages = []
+                    
+                    if knee_angle > knee_setpoint:
+                        feedback_messages.append("Bend your knee")
+                    elif knee_angle < knee_setpoint:
+                        feedback_messages.append("Straighten your knee")
+                    
+                    if hip_angle > hip_setpoint:
+                        feedback_messages.append("Straighten your hip")
+                    elif hip_angle < hip_setpoint:
+                        feedback_messages.append("Bend your hip")
+                    
+                    if elbow_angle > elbow_setpoint:
+                        feedback_messages.append("Bend your elbow")
+                    elif elbow_angle < elbow_setpoint:
+                        feedback_messages.append("Straighten your elbow")
+                    
+                    if torso_angle > back_setpoint:
+                        feedback_messages.append("Straighten your back")
+                    elif torso_angle < back_setpoint:
+                        feedback_messages.append("Bend your back")
+                    
+                    if shoulder_angle > shoulder_setpoint:
+                        feedback_messages.append("Raise/straighten shoulder")
+                    elif shoulder_angle < shoulder_setpoint:
+                        feedback_messages.append("Lower/bend shoulder")
+                    
+                    if neck_angle > neck_setpoint:
+                        feedback_messages.append("Lift your head")
+                    elif neck_angle < neck_setpoint:
+                        feedback_messages.append("Lower your head")
+                    
+                    if wrist_angle > wrist_setpoint:
+                        feedback_messages.append("Bend your wrist")
+                    elif wrist_angle < wrist_setpoint:
+                        feedback_messages.append("Straighten your wrist")
+                    
+                    # Queue popup request so it is created on the main thread
+                    popup_queue.put((f"⚠ POSTURE ALERT - Score: {score}/7", feedback_messages, 15))
+                status.append("ALARM: Low Score!")
+            else:
+                alarm_active = False
+                notification_shown = False
+            
+            # --- Queue row for Excel export (non-blocking) ---
+            # timestamp and seconds since start (start at 0)
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            seconds = int(time.time() - start_time)
+
+            # angle values and statuses
+            angles = [
+                (knee_angle, "OK" if "Knee OK" in status else "Bad"),
+                (hip_angle, "OK" if "Hip OK" in status else "Bad"),
+                (elbow_angle, "OK" if "Elbow OK" in status else "Bad"),
+                (wrist_angle, "OK" if "Wrist OK" in status else "Bad"),
+                (neck_angle, "OK" if "Neck OK" in status else "Bad"),
+                (shoulder_angle, "OK" if "Shoulder OK" in status else "Bad"),
+                (torso_angle, "OK" if "Torso OK" in status else "Bad")
+            ]
+
+            angle_names = ["Knee","Hip","Elbow","Wrist","Neck","Shoulder","Torso"]
+            bad_angles = [name for (name, s) in zip(angle_names, angles) if s[1] == "Bad"]
+
+            # posture category mapping
+            if 1 <= score <= 2:
+                category = "Risk"
+            elif 3 <= score <= 5:
+                category = "OK"
+            elif 6 <= score <= 7:
+                category = "Safe"
+            else:
+                category = "Risk"
+
+            row = [timestamp, seconds, score]
+            # append each angle value and its status
+            for ang_val, ang_stat in angles:
+                row.append(round(float(ang_val), 2))
+                row.append(ang_stat)
+
+            row.append(",".join(bad_angles))
+            row.append(category)
+
+            # Queue the row for background writing (non-blocking)
+            excel_queue.put((row, False))
+
+            # Collect data for 10-minute averaging
+            angle_buffer["knee"].append(knee_angle)
+            angle_buffer["hip"].append(hip_angle)
+            angle_buffer["elbow"].append(elbow_angle)
+            angle_buffer["wrist"].append(wrist_angle)
+            angle_buffer["neck"].append(neck_angle)
+            angle_buffer["shoulder"].append(shoulder_angle)
+            angle_buffer["torso"].append(torso_angle)
+            angle_buffer["score"].append(score)
+
+            # Check if 10 minutes have passed and record averages
+            current_time = time.time()
+            if current_time - last_average_time >= ten_minutes:
+                # Calculate averages
+                if angle_buffer["knee"]:  # ensure buffer has data
+                    avg_knee = sum(angle_buffer["knee"]) / len(angle_buffer["knee"])
+                    avg_hip = sum(angle_buffer["hip"]) / len(angle_buffer["hip"])
+                    avg_elbow = sum(angle_buffer["elbow"]) / len(angle_buffer["elbow"])
+                    avg_wrist = sum(angle_buffer["wrist"]) / len(angle_buffer["wrist"])
+                    avg_neck = sum(angle_buffer["neck"]) / len(angle_buffer["neck"])
+                    avg_shoulder = sum(angle_buffer["shoulder"]) / len(angle_buffer["shoulder"])
+                    avg_torso = sum(angle_buffer["torso"]) / len(angle_buffer["torso"])
+                    avg_score = sum(angle_buffer["score"]) / len(angle_buffer["score"])
+
+                    # Get time info
+                    period_end = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    period_start_dt = datetime.datetime.now() - datetime.timedelta(seconds=600)
+                    period_start = period_start_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+                    # Create average row
+                    avg_row = [
+                        period_start,
+                        period_end,
+                        10,
+                        round(avg_knee, 2),
+                        round(avg_hip, 2),
+                        round(avg_elbow, 2),
+                        round(avg_wrist, 2),
+                        round(avg_neck, 2),
+                        round(avg_shoulder, 2),
+                        round(avg_torso, 2),
+                        round(avg_score, 2)
+                    ]
+
+                    # Queue average row for background writing
+                    excel_queue.put(([avg_row], True))
+
+                    # Also show a 10-minute summary popup (non-blocking)
+                    try:
+                        popup_messages = [f"10-minute summary — Avg Score: {avg_score:.2f}"]
+                        popup_messages.append(f"Knee: {avg_knee:.1f}°  Hip: {avg_hip:.1f}°")
+                        popup_messages.append(f"Elbow: {avg_elbow:.1f}°  Wrist: {avg_wrist:.1f}°")
+                        popup_messages.append(f"Neck: {avg_neck:.1f}°  Shoulder: {avg_shoulder:.1f}°")
+                        popup_messages.append(f"Torso: {avg_torso:.1f}°")
+                        popup_queue.put((f"10-Minute Posture Summary: Avg {avg_score:.2f}", popup_messages, 20))
+                    except Exception:
+                        pass
+
+                    # Reset buffer and timer
+                    angle_buffer = {
+                        "knee": [],
+                        "hip": [],
+                        "elbow": [],
+                        "wrist": [],
+                        "neck": [],
+                        "shoulder": [],
+                        "torso": [],
+                        "score": []
+                    }
+                    last_average_time = current_time
+            status.append(f"Overall Score: {score}/7")
+            last_status = status
+            # วาด skeleton
+            mp_drawing.draw_landmarks(frame, lmk, mp_pose.POSE_CONNECTIONS)
+
+            # แสดงผลบนหน้าจอ
+            y0 = 30
+            for i, s in enumerate(last_status):
+                cv2.putText(frame, s, (10, y0 + i*30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0) if "OK" in s else (0,0,255), 2)
+                cv2.putText(frame, s, (10, y0 + i*30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0) if "OK" in s or "Overall Score" in s else (0,0,255), 2)
+        else:
+            # No landmarks yet, just show status if available
+            y0 = 30
+            for i, s in enumerate(last_status):
+                cv2.putText(frame, s, (10, y0 + i*30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0) if "OK" in s else (0,0,255), 2)
+
+        # Display frame once per loop (no blinking)
+        cv2.imshow("Ergonomics Pose Detector", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+# Cleanup
+write_stop.set()
+writer_thread.join(timeout=2)
+# Stop background pose worker
+process_stop.set()
+worker_thread.join(timeout=2)
+try:
+    hidden_tk_root.destroy()
+except Exception:
+    pass
+cap.release()
+cv2.destroyAllWindows()
