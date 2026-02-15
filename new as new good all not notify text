@@ -1,0 +1,218 @@
+import cv2
+import mediapipe as mp
+import math
+import threading
+import time
+import datetime
+import os
+import winsound
+from openpyxl import Workbook, load_workbook
+from win10toast import ToastNotifier
+
+# ================== Angle Utility ==================
+def calculate_angle(a, b, c):
+    ba = (a[0]-b[0], a[1]-b[1])
+    bc = (c[0]-b[0], c[1]-b[1])
+    dot = ba[0]*bc[0] + ba[1]*bc[1]
+    mag = math.hypot(*ba) * math.hypot(*bc)
+    if mag == 0:
+        return 0
+    return math.degrees(math.acos(max(min(dot/mag, 1), -1)))
+
+# ================== Threaded Camera ==================
+class ThreadedCamera:
+    def __init__(self, src=0):
+        self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+        time.sleep(1.0)  # 🔥 warm-up
+
+        if not self.cap.isOpened():
+            raise RuntimeError("❌ ไม่สามารถเปิดกล้องได้")
+
+        self.frame = None
+        self.ret = False
+        self.running = True
+        self.lock = threading.Lock()
+        threading.Thread(target=self.update, daemon=True).start()
+
+    def update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    self.ret = ret
+                    self.frame = frame
+
+    def read(self):
+        with self.lock:
+            return self.ret, self.frame
+
+    def release(self):
+        self.running = False
+        self.cap.release()
+
+# ================== Setup ==================
+mp_pose = mp.solutions.pose
+mp_draw = mp.solutions.drawing_utils
+toaster = ToastNotifier()
+
+cam = ThreadedCamera(0)
+cv2.namedWindow("Ergonomics Pose Detector", cv2.WINDOW_NORMAL)
+
+# ================== Excel (NEW FILE PER RUN) ==================
+base_dir = os.path.dirname(__file__)
+default_name = 'posture_log.xlsx'
+defaulut_path = os.path.join(base_dir, default_name)
+if os.path.exists(defaulut_path):
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_path = os.path.join(base_dir, f"posture_log_{ts}.xlsx")
+else:
+    excel_path = defaulut_path
+header = [
+    "DateTime",
+        "Seconds",
+        "Score",
+        "Knee_Angle",
+        "Knee_Status",
+        "Hip_Angle",
+        "Hip_Status",
+        "Elbow_Angle",
+        "Elbow_Status",
+        "Wrist_Angle",
+        "Wrist_Status",
+        "Neck_Angle",
+        "Neck_Status",
+        "Shoulder_Angle",
+        "Shoulder_Status",
+        "Torso_Angle",
+        "Torso_Status",
+        "BadAngles",
+        "PostureCategory"
+    ]
+average_header = [
+        "Period_Start",
+        "Period_End",
+        "Duration_Minutes",
+        "Avg_Knee_Angle",
+        "Avg_Hip_Angle",
+        "Avg_Elbow_Angle",
+        "Avg_Wrist_Angle",
+        "Avg_Neck_Angle",
+        "Avg_Shoulder_Angle",
+        "Avg_Torso_Angle",
+        "Avg_Score"
+    ]
+if not os.path.exists(excel_path):
+    wb = Workbook()
+    ws = wb.active
+    ws.append(header)
+    
+    wa_avg = wb.create_sheet("10min_avg")
+    wa_avg.append(average_header)
+    wb.save(excel_path)
+
+start_time = time.time()
+
+angle_buffer = {
+    "knee": [],
+    "hip": [],
+    "elbow": [],
+    "wrist": [],
+    "neck": [],
+    "shoulder": [],
+    "torso": [],
+    "score": []
+}
+last_log_time = time.time()
+last_avg_time = time.time()
+ten_minuts = 600   
+# ================== Alarm ==================
+alarm_active = False
+def alarm_loop():
+    while alarm_active:
+        winsound.Beep(1000, 300)
+        time.sleep(0.40)
+
+# ================== Main ==================
+with mp_pose.Pose(min_detection_confidence=0.5,
+                  min_tracking_confidence=0.5) as pose:
+
+    while True:
+        ret, frame = cam.read()
+        if not ret:
+            time.sleep(0.05)
+            continue
+
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(img_rgb)
+
+        score = 0
+        knee = hip = elbow = wrist = neck = shoulder = torso = 0
+
+        if results.pose_landmarks:
+            lm = results.pose_landmarks.landmark
+            def p(i): return [lm[i].x, lm[i].y]
+
+            knee = calculate_angle(p(24), p(26), p(28))
+            hip = calculate_angle(p(12), p(24), p(26))
+            elbow = calculate_angle(p(12), p(14), p(16))
+            wrist = calculate_angle(p(14), p(16), p(20))   # 🔥 FIXED
+            neck = calculate_angle(p(0), p(12), p(24))
+            shoulder = calculate_angle(p(14), p(12), p(24))
+            torso = calculate_angle(p(12), p(24), p(26))
+
+            checks = [
+                90 <= knee <= 100,
+                90 <= hip <= 100,
+                90 <= elbow <= 120,
+                9 <= wrist <= 10,
+                neck <= 15,
+                shoulder <= 20,
+                100 <= torso <= 110
+            ]
+            score = sum(checks)
+
+            # Alarm
+            if score < 3 and not alarm_active:
+                alarm_active = True
+                threading.Thread(target=alarm_loop, daemon=True).start()
+                toaster.show_toast(
+                    "Posture Alert",
+                    f"Poor posture detected\nScore: {score}/7",
+                    duration=5,
+                    threaded=True
+                )
+
+            if score >= 3:
+                alarm_active = False
+
+            mp_draw.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+            y = 30
+            for name, val in zip(
+                ["Knee","Hip","Elbow","Wrist","Neck","Shoulder","Torso"],
+                [knee, hip, elbow, wrist, neck, shoulder, torso]
+            ):
+                cv2.putText(frame, f"{name}: {int(val)}",
+                            (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7, (0,255,0), 2)
+                y += 25
+
+        # ===== Excel log (every 1 second) =====
+        if time.time() - last_log_time >= 1:
+            wb = load_workbook(excel_path)
+            ws = wb.active
+            ws.append([
+                datetime.datetime.now().strftime("%H:%M:%S"),
+                score,
+                int(knee), int(hip), int(elbow),
+                int(wrist), int(neck), int(shoulder), int(torso)
+            ])
+            wb.save(excel_path)
+            last_log_time = time.time()
+
+        cv2.imshow("Ergonomics Pose Detector", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+cam.release()
+cv2.destroyAllWindows()
