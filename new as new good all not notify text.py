@@ -19,14 +19,36 @@ def calculate_angle(a, b, c):
         return 0
     return math.degrees(math.acos(max(min(dot/mag, 1), -1)))
 
+# ================== Camera Detection ==================
+def find_available_cameras(max_devices=5):
+    """Find all available camera devices"""
+    available = []
+    for i in range(max_devices):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            available.append(i)
+            cap.release()
+    return available
+
 # ================== Threaded Camera ==================
 class ThreadedCamera:
     def __init__(self, src=0):
         self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
-        time.sleep(1.0)  # 🔥 warm-up
+        time.sleep(1.0)  # Warm-up
 
         if not self.cap.isOpened():
-            raise RuntimeError("❌ ไม่สามารถเปิดกล้องได้")
+            print(f"❌ Camera {src} failed. Searching for available cameras...")
+            available = find_available_cameras()
+            if available:
+                print(f"Available cameras: {available}")
+                src = available[0]
+                print(f"Using camera {src}...")
+                self.cap = cv2.VideoCapture(src, cv2.CAP_DSHOW)
+                time.sleep(1.0)
+                if not self.cap.isOpened():
+                    raise RuntimeError("❌ Could not open any camera")
+            else:
+                raise RuntimeError("❌ No cameras found. Check if webcam is connected.")
 
         self.frame = None
         self.ret = False
@@ -170,6 +192,20 @@ with mp_pose.Pose(min_detection_confidence=0.5,
                 100 <= torso <= 110
             ]
             score = sum(checks)
+
+            # Display warning image if neck posture is bad
+            if neck > 15:
+                warning_img_path = os.path.join(base_dir, "Warning_image", "neck.png")
+                if not os.path.exists(warning_img_path):
+                    warning_img_path = os.path.join(base_dir, "Warning_image", "neck.jpg")
+                
+                if os.path.exists(warning_img_path):
+                    warning_img = cv2.imread(warning_img_path)
+                    if warning_img is not None:
+                        # Resize to fit in corner (200x200)
+                        warning_img = cv2.resize(warning_img, (200, 200))
+                        # Place in top-right corner
+                        frame[10:210, frame.shape[1]-210:frame.shape[1]-10] = warning_img
 
             # Alarm
             if score < 3 and not alarm_active:
